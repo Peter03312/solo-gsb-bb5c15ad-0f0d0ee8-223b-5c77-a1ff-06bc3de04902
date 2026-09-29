@@ -99,7 +99,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 
 \* 请求字段从契约移除时服务端可能开始忽略/拒绝，工具以兼容记录并在原因中注明。
 
-结构层面还覆盖：路径与操作的新增/删除、pathItem 级与操作级参数合并比较、参数必填性 / `style` / `explode` / `deprecated`、请求体必填性变化、媒体类型增删（请求 415 / 响应 Content-Type）、响应状态码增删、`servers` 增删、`operationId` 变化、`oneOf/anyOf` 分支增删等。
+结构层面还覆盖：路径与操作的新增/删除、pathItem 级与操作级参数合并比较、参数必填性 / `style` / `explode` / `deprecated`、请求体必填性变化、媒体类型增删（请求 415 / 响应 Content-Type）、响应状态码增删、按**操作实际生效**的 `servers` 增删（操作级 → 路径级 → 根级优先，详见下文）、`operationId` 变化、`oneOf/anyOf` 分支增删等。
 
 ### 🔐 认证要求（security）兼容性
 
@@ -129,6 +129,94 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | `[]` | `[{}]` | — 等价，无发现 |
 
 内置示例「**认证要求收紧**」演示根级继承、操作级覆盖、`[]` 与 `[{}]` 等价、scope 追加、方案替换与新增「或」分支等场景。
+
+### 🌐 服务器地址（servers）生效优先级
+
+`servers` 可以声明在**根级、路径级（pathItem）与操作级（operation）**三个位置。工具不再只比较根级 `servers`，而是对**新旧文档的每一个共同操作**，先分别求出该操作在各自文档中**实际生效**的服务器列表，再按 URL 去重比较；新增 / 删除路径或操作仍由 `path-added` / `path-removed` / `operation-added` / `operation-removed` 覆盖，不会在这些操作上重复给出服务器结论。
+
+- **生效列表**：按 OpenAPI 3.x 优先级 **操作级 → 路径级 → 根级**，每层**取首个非空列表**（列表存在但为空、或全部条目无有效 `url` 时视为该层未提供，继续向下回落）；三层都没有时使用 OpenAPI 默认地址 **`/`**。路径项通过 `$ref` 引用组件时，以被引用 pathItem 组件内的声明为准（引用上的 `servers` 等兄弟字段按 3.1 语义忽略）。
+- **按 URL 集合比较**（同一份列表内重复 URL 只算一次、保持首次出现顺序）：
+  - 旧版生效列表中独有、新版不再提供的 URL → 🔴 破坏（`server-removed`）：仍在使用该地址的客户端将无法访问；
+  - 新版生效列表中独有的 URL → 🟢 兼容（`server-added`）：纯新增入口；
+  - 两侧 URL 集合完全相同（仅声明位置不同、重复项差异等）→ 不产生发现。
+- **被覆盖的下层地址不触发发现**：例如根级 `servers` 从 `https://a` 改成 `https://b`，但两侧同一操作都显式声明了操作级 `servers`，该操作实际生效地址未变，不会误报 `server-removed`；反之，操作级地址由 `https://x` 改成 `https://y`、而根级未动，也能正确报出 `https://x` 移除与 `https://y` 新增（旧实现只看根级会漏报）。
+- **定位**：每条发现标出所属操作（端点 `METHOD path`）与**两侧实际生效的声明位置**——`old_json_path` / `new_json_path` 指向真正生效的 `servers`（操作级 `/paths{path}/{method}/servers`、路径级 `/paths{path}/servers`、引用型 pathItem 锚到 `/components/pathItems/.../servers`、根级 `/servers`；三层均缺省时锚到操作对象）；`old_value` / `new_value` 给出：
+  - `source`：生效来源层 `operation`（操作级）/ `path`（路径级）/ `root`（根级）/ `default`（默认地址 `/`）；
+  - `pointer`：该侧生效声明的 JSON Pointer；
+  - `urls`：去重后实际生效的 URL 列表。
+
+服务器规则示例（均针对两版共有的 `GET /pets`）：
+
+| 旧版生效地址（来源） | 新版生效地址（来源） | 结论 |
+| --- | --- | --- |
+| `https://x`（operation） | `https://x`（operation），根级 `a→b` | — 根级被覆盖，无发现 |
+| `https://x`（operation） | `https://y`（operation） | 🔴 移除 `x` + 🟢 新增 `y` |
+| `https://p1`（path） | `https://p2`（path） | 🔴 移除 `p1` + 🟢 新增 `p2` |
+| `https://a`（root） | `https://b`（root） | 🔴 移除 `a` + 🟢 新增 `b` |
+| 默认 `/`（default） | `https://a`（root） | 🔴 移除 `/` + 🟢 新增 `https://a` |
+| `https://a, https://b`（root） | `https://b, https://c`（root） | 🔴 移除 `a` + 🟢 新增 `c`（`b` 不变） |
+
+该类发现归类为 **服务器 / 结构方向（direction = none）**，自动接入级别 / 方向 / 分类 / 关键字**筛选**、Markdown / JSON **报告**、破坏项**限时豁免**、**破坏项对账**、**根因聚合**与**最小复现包**（复现包会保留根级 `servers`、目标 path item 的路径级 `servers` 与操作本体，引用型 pathItem 经 `$ref` 闭包一并复制）。
+
+#### 服务器地址审查 HTTP 示例
+
+沿用现有审查接口，无需新增端点：`POST /api/reviews` 提交两份文档，结果中的 `findings` 即含 `server-removed` / `server-added`。
+
+```bash
+curl -X POST http://localhost:8000/api/reviews \
+  -H "Content-Type: application/json" \
+  -d '{
+    "title": "servers 优先级示例",
+    "old_spec": "openapi: \"3.0.3\"\ninfo: {title: Pets, version: \"1\"}\nservers:\n  - url: https://root-old.example.com\npaths:\n  /pets:\n    servers:\n      - url: https://path.example.com\n    get:\n      servers:\n        - url: https://op-x.example.com\n      responses:\n        \"200\": {description: ok}\n",
+    "new_spec": "openapi: \"3.0.3\"\ninfo: {title: Pets, version: \"2\"}\nservers:\n  - url: https://root-new.example.com\npaths:\n  /pets:\n    servers:\n      - url: https://path.example.com\n    get:\n      servers:\n        - url: https://op-y.example.com\n      responses:\n        \"200\": {description: ok}\n"
+  }'
+```
+
+根级地址虽然由 `https://root-old.example.com` 变为 `https://root-new.example.com`，但它被路径级 / 操作级声明覆盖，不产生发现；实际生效的操作级地址 `https://op-x.example.com → https://op-y.example.com` 报一条移除与一条新增，响应（节选）：
+
+```json
+{
+  "id": 1,
+  "summary": { "compatible": false, "by_category": { "服务器": 2 } },
+  "findings": [
+    {
+      "id": 1,
+      "rule_id": "server-removed",
+      "severity": "breaking",
+      "category": "服务器",
+      "direction": "none",
+      "change": "removed",
+      "endpoint": "GET /pets",
+      "location": "servers（GET /pets）",
+      "old_json_path": "/paths/~1pets/get/servers",
+      "new_json_path": "/paths/~1pets/get/servers",
+      "old_value": {
+        "source": "operation",
+        "pointer": "/paths/~1pets/get/servers",
+        "urls": ["https://op-x.example.com"]
+      },
+      "new_value": {
+        "source": "operation",
+        "pointer": "/paths/~1pets/get/servers",
+        "urls": ["https://op-y.example.com"]
+      }
+    },
+    {
+      "id": 2,
+      "rule_id": "server-added",
+      "severity": "non_breaking",
+      "endpoint": "GET /pets",
+      "old_json_path": "/paths/~1pets/get/servers",
+      "new_json_path": "/paths/~1pets/get/servers",
+      "old_value": { "source": "operation", "pointer": "/paths/~1pets/get/servers", "urls": ["https://op-x.example.com"] },
+      "new_value": { "source": "operation", "pointer": "/paths/~1pets/get/servers", "urls": ["https://op-y.example.com"] }
+    }
+  ]
+}
+```
+
+- 两侧根级、路径级或操作级地址完全相同（URL 集合一致）时，`findings` 中不出现任何 `server-*` 条目；
+- `GET /api/reviews/{id}` 返回的持久化结果、`GET /api/reviews/{id}/report?format=markdown|json` 报告与页面展示均包含同样的字段；新增 / 删除的路径或操作只出现 `path-*` / `operation-*`，不会附带服务器结论。
 
 > 页面内「规则说明」标签有完整列表；每条发现都带稳定的 `rule_id`（如 `property-became-required`、`enum-value-added`），便于在 CI 中按规则处理。
 
@@ -581,7 +669,7 @@ curl -X POST http://localhost:8000/api/reviews/1/link-preview \
 │   ├── main.py        # FastAPI：审查 / 历史 / 引用树 / 根因聚合 / 破坏项对账 / 组件可达性审计 / 调用清单影响定位 / 请求样本回放 / Link 参数预览 / 限时豁免 / 报告下载 / 健康检查接口
 │   ├── parser.py      # JSON·YAML 载入与 OpenAPI 3.x 校验
 │   ├── refs.py        # JSON Pointer、$ref 解析、循环安全的引用展开树
-│   ├── diff.py        # 语义兼容性规则引擎（请求/响应双方向 + 操作级/根级 security 认证要求）
+│   ├── diff.py        # 语义兼容性规则引擎（请求/响应双方向 + 操作级/根级 security 认证要求 + 操作级/路径级/根级 servers 生效地址比较）
 │   ├── groups.py      # 根因聚合：端点×方向分区、同源归并、祖先吸收的有向影响组
 │   ├── reconcile.py   # 破坏项对账：稳定身份配对，输出新增 / 延续 / 已消失
 │   ├── reachability.py # 组件可达性审计：paths/webhooks 入口 → 本地 $ref 传递追踪，未触达组件与无效引用
@@ -606,7 +694,7 @@ curl -X POST http://localhost:8000/api/reviews/1/link-preview \
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
-| `POST` | `/api/reviews` | 提交 `{old_spec, new_spec, api_id?, ...}` 执行审查并持久化（响应含豁免视图） |
+| `POST` | `/api/reviews` | 提交 `{old_spec, new_spec, api_id?, ...}` 执行审查并持久化（响应含豁免视图）；`server-removed` / `server-added` 按每个共同操作的**实际生效** servers（操作级 → 路径级 → 根级 → 默认 `/`）报告，调用示例见下文「🌐 服务器地址审查 HTTP 示例」 |
 | `GET` | `/api/reviews` | 历史审查列表 |
 | `GET` | `/api/reviews/{id}` | 审查详情（含全部 findings 与实时豁免视图） |
 | `PATCH` | `/api/reviews/{id}` | 设置 / 清除审查的 API 标识 `{api_id}` |

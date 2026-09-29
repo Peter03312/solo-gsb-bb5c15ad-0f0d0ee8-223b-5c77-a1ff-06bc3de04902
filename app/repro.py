@@ -116,6 +116,10 @@ def _trim_path_item(item: Any, method: str | None) -> Any:
     if method is None or isinstance(item.get("$ref"), str):
         return copy.deepcopy(item)
     out: dict[str, Any] = {}
+    # 路径级 servers 与 parameters 一样会被操作级比较继承，必须保留才能
+    # 原样复现"操作实际生效的 servers"（操作级缺省时回落到路径级）。
+    if isinstance(item.get("servers"), list):
+        out["servers"] = copy.deepcopy(item["servers"])
     if isinstance(item.get("parameters"), list):
         out["parameters"] = copy.deepcopy(item["parameters"])
     if isinstance(item.get(method), dict):
